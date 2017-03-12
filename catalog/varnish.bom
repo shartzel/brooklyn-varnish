@@ -1,0 +1,321 @@
+  brooklyn.catalog:
+    version: "0.1"
+    id: varnish-node
+    name: Varnish Node
+    iconUrl: "https://www.varnish-cache.org/_static/varnish-bunny.png"
+    itemType: entity
+    description: |
+      Varnish Cache web app accelerator. https://www.varnish-cache.org/
+    publish:
+      license_code: Apache-2.0
+      overview: README.md
+    item:
+      type: centos-software-process
+      name: Varnish Node
+      brooklyn.parameters:
+        - name: varnish.vcl.conf
+          label: "VCL Configuration File"
+          default: /etc/varnish/brooklyn.vcl
+          description: |
+            Path on filesystem for the VCL Configuration
+          pinned: false
+        - name: varnish.vcl.url
+          label: "VCL Configuration URL"
+          description: |
+            URL to a file to be downloaded and placed as Varnish VCL configuration
+          pinned: false
+        - name: varnish.vcl.customization
+          label: "VCL custom content"
+          description: |
+            Content to be appended to the VCL configuration file
+          pinned: false
+        - name: varnish.port
+          label: "Varnish Listen Port"
+          default: 80
+          description: |
+            Frontend port for Varnish
+        - name: varnish.admin.ip
+          label: "Varnish Admin IP"
+          default: 127.0.0.1
+          description: |
+            IP Address for Varnish Admin console
+          pinned: false
+        - name: varnish.admin.port
+          label: "Varnish Admin Port"
+          default: 6082
+          description: |
+            Port for Varnish Admin console
+          pinned: false
+        - name: varnish.memory
+          label: "Size of (malloc) cache"
+          default: 256M
+          description: |
+            Size of memory for malloc storage
+        - name: varnish.user
+          label: "User to run Varnish"
+          default: varnish
+          description: |
+            Varnish User
+          pinned: false
+        - name: varnish.group
+          label: "Group to run Varnish"
+          default: varnish
+          description: |
+            Varnish Port
+          pinned: false
+        - name: varnish.backend.ips
+          label: "Backend IP Address"
+          default: 127.0.0.1
+          description: |
+            Single IP Address for Backend Server, or comma separated list of backend IPs
+        - name: varnish.backend.port
+          label: "Backend Port"
+          default: 8080
+          description: |
+            Port for Backend Server
+
+      brooklyn.config:
+        shell.env:
+          VCL_CONF: $brooklyn:config("varnish.vcl.conf")
+          VCL_CONF_URL: $brooklyn:config("varnish.vcl.url")
+          VCL_CONF_CUSTOMIZATION: $brooklyn:config("varnish.vcl.customization")
+          LISTEN_PORT: $brooklyn:config("varnish.port")
+          ADMIN_LISTEN_IP: $brooklyn:config("varnish.admin.ip")
+          ADMIN_LISTEN_PORT: $brooklyn:config("varnish.admin.port")
+          VARNISH_USER: $brooklyn:config("varnish.user")
+          VARNISH_GROUP: $brooklyn:config("varnish.group")
+          MEM: $brooklyn:config("varnish.memory")
+          BACKEND_IPS: $brooklyn:config("varnish.backend.ips")
+          BACKEND_PORT: $brooklyn:config("varnish.backend.port")
+          INSTALL_DIR: $brooklyn:attributeWhenReady("install.dir")
+    
+        pre.install.command: |
+          sudo yum update -y
+    
+        install.command: |
+          sudo yum install -y epel-release
+          sudo yum install -y varnish
+          sudo systemctl enable varnish
+          # Write utility functions
+          cat <<'END_OF_FUNCTIONS'>> ${INSTALL_DIR}/varnish_functions.sh
+          _write_varnish_params() {
+          sudo -E tee /etc/varnish/varnish.params <<-EOF_PARAMS
+          RELOAD_VCL=1
+          VARNISH_VCL_CONF=${VCL_CONF}
+          VARNISH_LISTEN_PORT=${LISTEN_PORT}
+          VARNISH_ADMIN_LISTEN_ADDRESS=${ADMIN_LISTEN_IP}
+          VARNISH_ADMIN_LISTEN_PORT=${ADMIN_LISTEN_PORT}
+          VARNISH_SECRET_FILE=/etc/varnish/secret
+          VARNISH_STORAGE="malloc,${MEM}"
+          VARNISH_USER=${VARNISH_USER}
+          VARNISH_GROUP=${VARNISH_GROUP}
+          EOF_PARAMS
+          }
+
+          _write_varnish_config() {
+          # Write VCL configuration file
+          # If we've been provided with a URL, use that
+          if [[ ! -z "${VCL_CONF_URL}" ]]; then
+              sudo curl -o ${VCL_CONF} ${VCL_CONF_URL}
+          else
+              echo "vcl 4.0;" | sudo -E tee ${VCL_CONF}
+              # If there is only one backend IP, configure as backend "default"
+              if [ $(echo $BACKEND_IPS | awk -F ',' '{print NF}') -eq 1 ]; then
+                  echo "backend default { .host = \"${BACKEND_IPS}\"; .port = \"${BACKEND_PORT}\"; }" | sudo -E tee -a ${VCL_CONF}
+              else
+                  be_count=0
+                  echo "import directors;" | sudo -E tee -a ${VCL_CONF}
+                  # Configure multiple backends
+                  for be_ip in $(echo ${BACKEND_IPS} | sed "s/,/ /g")
+                  do
+                      let "be_count+=1"
+                      echo "backend be$be_count { .host = \"${be_ip}\"; .port = \"${BACKEND_PORT}\"; }" | sudo -E tee -a ${VCL_CONF}
+                  done
+                  # Configure round robin director
+                  echo "sub vcl_init { " | sudo -E tee -a ${VCL_CONF}
+                  echo "    new d = directors.round_robin();" | sudo -E tee -a ${VCL_CONF}
+                  for i in $(seq 1 $be_count)
+                  do 
+                      echo "    d.add_backend(be$i);" | sudo -E tee -a ${VCL_CONF}
+                  done
+                  echo "}" | sudo -E tee -a ${VCL_CONF}
+                  # Use director as backend
+                  echo "sub vcl_recv { set req.backend_hint = d.backend(); }" | sudo -E tee -a ${VCL_CONF}
+              fi
+          fi
+          }
+
+          _append_custom_vcl() {
+          # If the user provides custom VCL, append it. Appending it is
+          # usually ok, as the documenation
+          # (http://www.varnish-cache.org/docs/4.0/reference/vcl.html) states:
+          # "If multiple subroutines with the name of one of the built-in ones
+          # are defined, they are concatenated in the order in which they
+          # appear in the source. The built-in VCL distributed with Varnish will
+          # be implicitly concatenated when the VCL is compiled."
+          if [[ ! -z "${VCL_CONF_CUSTOMIZATION}" ]]; then
+              echo ${VCL_CONF_CUSTOMIZATION} | sudo -E tee -a ${VCL_CONF}
+          fi
+          }
+
+          _configure_varnish() {
+          _write_varnish_params
+          _write_varnish_config
+          _append_custom_vcl
+          }
+
+          _reconfigure_and_restart() {
+          _configure_varnish
+          sudo systemctl restart varnish
+          }
+          END_OF_FUNCTIONS
+
+        customize.command: |
+          source ${INSTALL_DIR}/varnish_functions.sh
+          _configure_varnish
+    
+        launch.command: |
+          sudo systemctl start varnish
+    
+        checkRunning.command: |
+          pgrep varnishd
+    
+        stop.command: |
+          sudo systemctl stop varnish
+    
+      brooklyn.initializers:
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.cache_hit
+          command: |
+            varnishstat -1 -f MAIN.cache_hit|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.cache_hitpass
+          command: |
+            varnishstat -1 -f MAIN.cache_hitpass|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.cache_miss
+          command: |
+            varnishstat -1 -f MAIN.cache_miss|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.client_req
+          command: |
+            varnishstat -1 -f MAIN.client_req|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.threads_limited
+          command: |
+            varnishstat -1 -f MAIN.threads_limited|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.threads_failed
+          command: |
+            varnishstat -1 -f MAIN.threads_failed|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.thread_queue_len
+          command: |
+            varnishstat -1 -f MAIN.thread_queue_len|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.sess_conn
+          command: |
+            varnishstat -1 -f MAIN.sess_conn|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.sess_queued
+          command: |
+            varnishstat -1 -f MAIN.sess_queued|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.sess_dropped
+          command: |
+            varnishstat -1 -f MAIN.sess_dropped|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.n_expired
+          command: |
+            varnishstat -1 -f MAIN.n_expired|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.n_lru_nuked
+          command: |
+            varnishstat -1 -f MAIN.n_lru_nuked|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.n_object
+          command: |
+            varnishstat -1 -f MAIN.n_object|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.uptime
+          command: |
+            varnishstat -1 -f MAIN.uptime|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.backend_unhealthy
+          command: |
+            varnishstat -1 -f MAIN.backend_unhealthy|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.sensor.ssh.SshCommandSensor
+        brooklyn.config:
+          name: varnish.MAIN.backend_fail
+          command: |
+            varnishstat -1 -f MAIN.backend_fail|awk '{print $2}'
+          period: 5m
+      - type: org.apache.brooklyn.core.effector.ssh.SshCommandEffector
+        brooklyn.config:
+          name: varnishReload
+          description: |
+            Reloads Varnish
+          command: |
+            sudo systemctl reload varnish
+      - type: org.apache.brooklyn.core.effector.ssh.SshCommandEffector
+        brooklyn.config:
+          name: varnishStats
+          description: |
+            Show all Varnish stats
+          command: |
+            varnishstat -1
+      - type: org.apache.brooklyn.core.effector.ssh.SshCommandEffector
+        brooklyn.config:
+          name: varnishParams
+          description: |
+            Show all Varnish parameters
+          command: |
+            sudo varnishadm param.show
+      - type: org.apache.brooklyn.core.effector.ssh.SshCommandEffector
+        brooklyn.config:
+          name: varnishBan
+          description: |
+            Invalidate cache objects
+          command: |
+            sudo varnishadm ban $ban_string
+          parameters:
+            ban_string:
+              description: String to pass to ban. <field> <operator> <arg> [&& <field> <oper> <arg> ...]
+      - type: org.apache.brooklyn.core.effector.ssh.SshCommandEffector
+        brooklyn.config:
+          name: reconfigureAndRestart
+          description: |
+            Re-writes configuration, and re-starts Varnish
+          command: |
+            source ${INSTALL_DIR}/varnish_functions.sh
+            _reconfigure_and_restart

@@ -1,0 +1,56 @@
+brooklyn.catalog:
+  version: "0.1"
+  items:
+    - "https://raw.githubusercontent.com/brooklyncentral/common-catalog-utils/master/common-tests/src/main/resources/commontests/common.tests.bom"
+    - id: varnish-node-tests
+      version: "0.1"
+      itemType: template
+      iconUrl: "https://www.varnish-cache.org/_static/varnish-bunny.png"
+      name: "Varnish Node Tests"
+      item:
+        services:
+        - type: varnish-node
+          id: varnish-node
+        - type: varnish-node
+          id: varnish-node-multi-backend
+          brooklyn.config:
+            varnish.backend.ips: 1.2.3.4,1.2.3.5
+        - type: test-case
+          name: "Varnish Node Tests"
+          brooklyn.config:
+            timeout: 1h
+            targetId: varnish-node
+            process.grep.name: "/usr/sbin/[v]arnishd"
+          brooklyn.children:
+          - type: assert-up-and-running-initial
+            name: "01. Varnish Node up and running"
+          - type: assert-restart-process
+            name: "02. Varnish Node restart process"
+          - type: assert-stop-and-restart-process
+            name: "03. Varnish Node stop and restart process"
+          - type: invoke-effector
+            name: "04. Check varnishStats effector"
+            brooklyn.config:
+              effector: varnishStats
+              assert:
+              - contains: MAIN.uptime
+          - type: invoke-effector
+            # all other effectors are just different args to varnishadm
+            # so we'll only test one of them
+            name: "05. Check varnishParams effector"
+            brooklyn.config:
+              effector: varnishParams
+              assert:
+              - contains: acceptor_sleep_decay
+        - type: test-case
+          name: "Varnish Node Basic Multi-backend"
+          brooklyn.config:
+            timeout: 1h
+            targetId: varnish-node-multi-backend
+            process.grep.name: "/usr/sbin/[v]arnishd"
+          brooklyn.children:
+          # Verify that the vcl config was written properly with multiple
+          # backends and a director; any syntax issues and the vcl won't
+          # compile and varnish won't start
+          - type: assert-up-and-running-initial
+            name: "01. Varnish Node up and running"
